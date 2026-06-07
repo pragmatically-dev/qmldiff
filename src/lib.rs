@@ -44,6 +44,51 @@ lazy_static! {
     static ref SLOTS_DISABLED: Mutex<bool> = Mutex::new(false);
     static ref EXTERNAL_LOADER: Mutex<Option<CExternalLoaderFunc>> = Mutex::new(None);
     static ref SEEN_FILES: Mutex<HashSet<FileId>> = Mutex::new(HashSet::new());
+    // Pristine, pre-slot-processing changes per source ("" key = file-loaded base),
+    // kept in load order. SLOTS + CHANGES are derived from these by rebuild_changes,
+    // so adding or replacing a diff re-resolves all slots deterministically.
+    static ref RAW_DIFFS: Mutex<Vec<(String, Vec<Change>)>> = Mutex::new(Vec::new());
+    // Set when RAW_DIFFS changes; the merged CHANGES/SLOTS are rebuilt lazily on
+    // next read, so loading N diffs at startup stays O(N) (one rebuild), not O(N^2).
+    static ref CHANGES_DIRTY: Mutex<bool> = Mutex::new(false);
+}
+
+/// Rebuild the merged CHANGES/SLOTS if RAW_DIFFS changed since the last build.
+/// Cheap no-op when clean; called at the start of every reader.
+fn ensure_changes() {
+    let dirty = {
+        let mut d = CHANGES_DIRTY.lock().unwrap();
+        let was = *d;
+        *d = false;
+        was
+    };
+    if dirty {
+        rebuild_changes();
+    }
+}
+
+/// Rebuild SLOTS and CHANGES from scratch out of the pristine RAW_DIFFS. This is
+/// the single source of truth for the merged change set: it re-derives the slot
+/// table and (post-init) re-expands every slot reference across *all* files, so a
+/// live `qmldiff_replace_external_diff` cannot leave stale, duplicated, or
+/// cross-file-unresolved slot state behind. Idempotent.
+fn rebuild_changes() {
+    let mut all: Vec<Change> = RAW_DIFFS
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|(_, changes)| changes.iter().cloned())
+        .collect();
+    // Read POST_INIT before locking SLOTS to keep the POST_INIT->SLOTS lock order.
+    let post_init = *POST_INIT.lock().unwrap();
+    let mut slots = Slots::new();
+    slots.update_slots(&mut all); // strips slot/template definitions, fills `slots`
+    if post_init {
+        // Slots were already sealed during normal init, so expand references now.
+        slots.process_slots(&mut all);
+    }
+    *SLOTS.lock().unwrap() = slots;
+    *CHANGES.lock().unwrap() = all;
 }
 
 #[no_mangle]
@@ -74,6 +119,41 @@ extern "C" fn qmldiff_load_rules(rules: *const c_char) {
     }
 }
 
+// Shared ingest path for external diffs (both initial add and live replace).
+// Parses `contents` under the identifier `id`, version-filters, and registers
+// its slots. When `replace` is set, any previously-loaded changes from the same
+// `id` are dropped first (matched on `Change::source`, which equals `id`). After
+// init we must process slots here, since the normal seal-on-first-process has
+// already happened and would otherwise leave a live replacement's slots unfilled.
+fn ingest_external(id: &str, contents: &str, replace: bool) -> anyhow::Result<usize> {
+    let mut parsed = parse_diff(
+        None,
+        contents.to_string(),
+        id,
+        &HASHTAB.lock().unwrap(),
+        None,
+        None, // External diffs are exempt from seen-files checking.
+    )?;
+    filter_out_non_matching_versions(&mut parsed, CURRENT_VERSION.lock().unwrap().clone(), id);
+    let count = parsed.len();
+    {
+        // Store the pristine changes keyed by id; a replace drops prior entries
+        // for this id first. SLOTS/CHANGES are derived by rebuild_changes below.
+        let mut raw = RAW_DIFFS.lock().unwrap();
+        if replace {
+            raw.retain(|(existing, _)| existing != id);
+        }
+        raw.push((id.to_string(), parsed));
+    }
+    *CHANGES_DIRTY.lock().unwrap() = true;
+    // A replace is a live hot-reload: rebuild now so the change takes effect
+    // immediately. An add at startup defers to the first reader (kept O(N)).
+    if replace {
+        ensure_changes();
+    }
+    Ok(count)
+}
+
 #[no_mangle]
 extern "C" fn qmldiff_add_external_diff(
     change_file_contents: *const c_char,
@@ -98,14 +178,11 @@ extern "C" fn qmldiff_add_external_diff(
         .to_str()
         .unwrap()
         .into();
-    match parse_diff(
-        None,
-        change_file_contents,
-        &file_identifier,
-        &HASHTAB.lock().unwrap(),
-        None,
-        None, // External diffs are exempt from seen-files checking.
-    ) {
+    match ingest_external(&file_identifier, &change_file_contents, false) {
+        Ok(_) => {
+            eprintln!("[qmldiff]: Loaded external {}", &file_identifier);
+            true
+        }
         Err(problem) => {
             eprintln!(
                 "[qmldiff]: Failed to load external {}: {:?}",
@@ -113,17 +190,80 @@ extern "C" fn qmldiff_add_external_diff(
             );
             false
         }
-        Ok(mut contents) => {
-            filter_out_non_matching_versions(
-                &mut contents,
-                CURRENT_VERSION.lock().unwrap().clone(),
-                &file_identifier,
+    }
+}
+
+/// Hot reload: replace a previously-loaded external diff in place. Drops the old
+/// changes for `file_identifier` and ingests the new contents under the same id.
+/// Pair this with `qrr_reload_external_diff` in qt-resource-rebuilder, which
+/// re-registers the affected Qt resource roots afterwards.
+///
+/// # Safety
+/// `change_file_contents` and `file_identifier` must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn qmldiff_replace_external_diff(
+    change_file_contents: *const c_char,
+    file_identifier: *const c_char,
+) -> bool {
+    if is_building_hashtab() {
+        return false;
+    }
+    let file_identifier: String = CStr::from_ptr(file_identifier).to_str().unwrap().into();
+    let change_file_contents: String = CStr::from_ptr(change_file_contents)
+        .to_str()
+        .unwrap()
+        .into();
+    match ingest_external(&file_identifier, &change_file_contents, true) {
+        Ok(count) => {
+            eprintln!(
+                "[qmldiff]: Reloaded external {} ({} change(s))",
+                &file_identifier, count
             );
-            SLOTS.lock().unwrap().update_slots(&mut contents);
-            eprintln!("[qmldiff]: Loaded external {}", &file_identifier);
-            CHANGES.lock().unwrap().extend(contents);
             true
         }
+        Err(problem) => {
+            eprintln!(
+                "[qmldiff]: Failed to reload external {}: {:?}",
+                &file_identifier, problem
+            );
+            false
+        }
+    }
+}
+
+/// The qmd -> qml binding: a newline-joined list of the qrc paths a given
+/// external diff targets, so the resource rebuilder knows exactly which roots to
+/// re-register on a hot reload. The returned string is heap-allocated; free it
+/// with `qmldiff_free_string`.
+///
+/// # Safety
+/// `file_identifier` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn qmldiff_targets_of(file_identifier: *const c_char) -> *mut c_char {
+    ensure_changes();
+    let file_identifier: String = CStr::from_ptr(file_identifier).to_str().unwrap().into();
+    let changes = CHANGES.lock().unwrap();
+    let mut targets: Vec<String> = changes
+        .iter()
+        .filter(|change| change.source.as_str() == file_identifier.as_str())
+        .filter_map(|change| match &change.destination {
+            ObjectToChange::File(path) | ObjectToChange::FileTokenStream(path) => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    targets.sort();
+    targets.dedup();
+    CString::new(targets.join("\n")).unwrap().into_raw()
+}
+
+/// Free a string returned by `qmldiff_targets_of`.
+///
+/// # Safety
+/// `pointer` must be null or a value previously returned by `qmldiff_targets_of`.
+#[no_mangle]
+pub unsafe extern "C" fn qmldiff_free_string(pointer: *mut c_char) {
+    if !pointer.is_null() {
+        drop(CString::from_raw(pointer));
     }
 }
 
@@ -169,7 +309,6 @@ extern "C" fn qmldiff_build_change_files(root_dir: *const c_char) -> i32 {
     }
     let mut loaded_files = 0i32;
     let mut all_changes = Vec::new();
-    let mut slots = Slots::new();
 
     eprintln!("[qmldiff]: Iterating over directory {}", &root_dir);
 
@@ -211,16 +350,21 @@ extern "C" fn qmldiff_build_change_files(root_dir: *const c_char) -> i32 {
                         CURRENT_VERSION.lock().unwrap().clone(),
                         file,
                     );
-                    slots.update_slots(&mut contents);
-                    all_changes.extend(contents);
+                    all_changes.extend(contents); // keep raw; slots derived in rebuild
                     loaded_files += 1;
                 }
             }
         }
     }
 
-    SLOTS.lock().unwrap().0.extend(slots.0);
-    CHANGES.lock().unwrap().extend(all_changes);
+    drop(seen_locked);
+    if !all_changes.is_empty() {
+        RAW_DIFFS
+            .lock()
+            .unwrap()
+            .push((format!("<files>:{}", root_dir), all_changes));
+        *CHANGES_DIRTY.lock().unwrap() = true;
+    }
     loaded_files
 }
 
@@ -236,6 +380,7 @@ pub unsafe extern "C" fn qmldiff_is_modified(file_name: *const c_char) -> bool {
         return true;
     }
 
+    ensure_changes();
     CHANGES
         .lock()
         .unwrap()
@@ -274,6 +419,7 @@ pub unsafe extern "C" fn qmldiff_process_file(
     raw_contents: *const c_char,
     _contents_size: usize,
 ) -> *const c_char {
+    ensure_changes();
     let mut post_init = POST_INIT.lock().unwrap();
     let are_slots_disabled = SLOTS_DISABLED.lock().unwrap().clone();
     if !*post_init && !are_slots_disabled {
